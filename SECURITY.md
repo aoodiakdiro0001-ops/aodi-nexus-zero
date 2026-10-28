@@ -3,7 +3,7 @@
 ## Threat model (what this defends, and what it does not)
 
 Nexus-Zero runs on **your** free-tier accounts (GitHub, Telegram, Cloudflare,
-optionally Turso/Hugging Face) and holds **your** tokens in **your** secrets
+optionally Hugging Face) and holds **your** tokens in **your** secrets
 store. It is a personal automation mesh, not a multi-tenant service. The
 design assumes:
 
@@ -40,7 +40,9 @@ Telegram/you → Cloudflare Worker (edge, stateless, secret-guarded)
 ```
 
 Your message passes through the edge only to reach your own runner. Memory
-lives where you point `NEXUS_DB` — a local file, or your own Turso/Supabase.
+lives where you point `NEXUS_DB` — a local SQLite file (persisted by Actions).
+A remote libsql/Turso URL is rejected by design (`sqlite3.connect` can't open
+a URL); bring your own HTTP libsql adapter behind `Memory` if you need one.
 You can delete everything by deleting the repo and the memory database.
 
 ## Responsible use

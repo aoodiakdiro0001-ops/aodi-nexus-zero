@@ -16,7 +16,7 @@ Hardened after audit:
 import os
 import time
 
-from .core import Nexus
+from .core import Nexus, safe
 from .memory import Memory
 from . import telegram as tg
 
@@ -39,7 +39,9 @@ def tick(db=None, brain=None, notify=True, log=print):
                 mem.bump_attempt(event_id)
                 failed += 1
                 if log:
-                    log("event %s failed: %s" % (event_id, str(e)[:120]))
+                    # safe() strips control chars, _redact blanks tokens — an
+                    # exception can echo a provider URL or forge log lines.
+                    log("event %s failed: %s" % (event_id, tg._redact(safe(e))))
                 continue
             processed += 1
             replies.append(res)

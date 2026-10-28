@@ -135,6 +135,8 @@ class OllamaBrain(object):
         try:
             return self._chat(msgs).strip() or "(no output)"
         except Exception as e:
+            if os.environ.get("NEXUS_DEBUG_BODY") == "1":
+                return "(inference unavailable: %s)" % _redact(str(e))
             return "(inference unavailable)"      # detail only at debug
 
     def embed(self, text):

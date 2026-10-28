@@ -3,22 +3,28 @@
 Honest scope (v1.0.0): this store is LOCAL SQLite. The `NEXUS_DB` DSN swap
 promised in v1.0.0 was false — sqlite3.connect() cannot open a libsql:// or
 https:// URL, so pointing NEXUS_DB at Turso silently created a junk file. We
-now FAIL LOUDLY on a remote DSN instead of pretending. True cloud memory
-needs an HTTP libsql client (a dependency) — bring your own adapter behind
-this interface, or persist the local file (the Actions workflow commits it).
+now FAIL LOUDLY on any URL/DSN instead of pretending. True cloud memory needs
+an HTTP libsql client (a dependency) — bring your own adapter behind this
+interface, or persist the local file (the Actions workflow commits it).
 
-Hardening after a security+architecture audit:
-  * WAL + busy_timeout + explicit claim tokens -> concurrent ticks never
-    double-process or deadlock on the same DB.
-  * events: raw_id dedupe (at-least-once source retries don't duplicate),
-    attempts counter + dead-letter (a poison event can't wedge the queue).
-  * facts/messages/history/search are THREAD-scoped (no cross-chat leakage).
-  * FTS5 correlated on rowid (the old alias bug silently degraded to a full
-    table LIKE scan on every recall).
-  * file created 0600, parent dirs auto-created, control chars stripped at
-    print sinks only (raw data preserved at rest).
+Hardening after a security+architecture audit (+ a focused review pass):
+  * WAL + busy_timeout + token claims -> concurrent ticks never double-process.
+  * ABANDONED-CLAIM RECLAIM: a crash after `handled=2` no longer strands the
+    row forever; stale claims are released after CLAIM_TTL and retried.
+  * events: raw_id dedupe (rowcount-detected) + attempts/counter + dead-letter.
+  * messages: per-event idempotency (event_id + unique index) so a retried
+    event can't durably duplicate conversation history or skew FTS rank.
+  * facts/messages/history/search are THREAD-scoped (no cross-chat leakage),
+    and search() can EXCLUDE the row just written (no self-match on recall).
+  * FTS5 correlated on rowid; `rank` referenced by real table name (an alias
+    in ORDER BY raises "no such column: f" and silently degraded to LIKE).
+  * file chmod 0600 ALWAYS (a checked-out DB is 0644 under the runner umask);
+    ANY scheme:// DSN is rejected (not just libsql/http/https).
+  * outbox reaches a terminal state (sent=2) on exhaustion instead of
+    silently dropping the reply with no trace.
 """
 import os
+import re
 import sqlite3
 import time
 import uuid
@@ -34,7 +40,8 @@ CREATE TABLE IF NOT EXISTS events (
   raw_id TEXT,
   handled INTEGER DEFAULT 0,
   attempts INTEGER DEFAULT 0,
-  claim TEXT
+  claim TEXT,
+  claimed REAL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS events_dedupe
   ON events(source, raw_id) WHERE raw_id IS NOT NULL;
@@ -43,8 +50,11 @@ CREATE TABLE IF NOT EXISTS messages (
   ts REAL NOT NULL,
   thread TEXT NOT NULL,
   role TEXT NOT NULL,
-  text TEXT NOT NULL
+  text TEXT NOT NULL,
+  event_id INTEGER
 );
+CREATE UNIQUE INDEX IF NOT EXISTS messages_event
+  ON messages(thread, role, event_id) WHERE event_id IS NOT NULL;
 CREATE TABLE IF NOT EXISTS facts (
   thread TEXT NOT NULL DEFAULT 'default',
   key TEXT NOT NULL,
@@ -73,6 +83,8 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(text);
 
 DEFAULT_DB = os.environ.get("NEXUS_DB", "nexus-zero.db")
 MAX_ATTEMPTS = 5
+CLAIM_TTL = 900          # a claim older than this is presumed abandoned
+_URL_DSN = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*://")
 
 
 def _clamp_limit(limit):
@@ -85,25 +97,37 @@ def _clamp_limit(limit):
 class Memory(object):
     def __init__(self, path=None):
         self.path = os.path.expanduser(path or DEFAULT_DB)
-        if self.path.startswith(("libsql://", "http://", "https://")):
+        if _URL_DSN.match(self.path):
             raise ValueError(
-                "NEXUS_DB must be a local SQLite path; a remote libsql URL "
-                "needs an HTTP client (not sqlite3.connect). Persist the local "
-                "file or bring a libsql adapter.")
+                "NEXUS_DB must be a local SQLite path, not a URL/DSN; a remote "
+                "libsql URL needs an HTTP client (not sqlite3.connect). Persist "
+                "the local file or bring a libsql adapter.")
         parent = os.path.dirname(os.path.abspath(self.path))
         if parent:
             os.makedirs(parent, exist_ok=True)
-        fresh = not os.path.exists(self.path)
         self.conn = sqlite3.connect(self.path, timeout=30.0, isolation_level=None)
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA busy_timeout=30000")
         self.conn.execute("PRAGMA synchronous=NORMAL")
-        if fresh:
-            try:
-                os.chmod(self.path, 0o600)
-            except OSError:
-                pass
+        try:
+            os.chmod(self.path, 0o600)          # ALWAYS, not just when fresh
+        except OSError:
+            pass
         self.conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self):
+        """Additive, idempotent column upgrades for DBs made by older builds."""
+        def has(col, table):
+            cols = {r[1] for r in self.conn.execute("PRAGMA table_info(%s)" % table)}
+            return col in cols
+        if not has("claimed", "events"):
+            self.conn.execute("ALTER TABLE events ADD COLUMN claimed REAL")
+        if not has("event_id", "messages"):
+            self.conn.execute("ALTER TABLE messages ADD COLUMN event_id INTEGER")
+            self.conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS messages_event "
+                "ON messages(thread, role, event_id) WHERE event_id IS NOT NULL")
 
     # ------------------------------------------------------------- events
     def add_event(self, source, text, sender=None, raw=None, raw_id=None):
@@ -124,13 +148,19 @@ class Memory(object):
     def claim(self, n=50):
         """Atomically claim up to n pending events (marks them in-progress).
 
-        Token-based so two concurrent ticks never claim the same row.
+        Reclaims stale claims first so a crashed tick can't strand rows. Token
+        + timestamp based so two concurrent ticks never claim the same row.
         """
+        now = time.time()
+        # release rows abandoned by a dead/crashed tick (handled=2, stale)
+        self.conn.execute(
+            "UPDATE events SET handled=0, claim=NULL "
+            "WHERE handled=2 AND COALESCE(claimed, 0) < ?", (now - CLAIM_TTL,))
         token = uuid.uuid4().hex
         self.conn.execute(
-            "UPDATE events SET handled=2, claim=? WHERE id IN "
+            "UPDATE events SET handled=2, claim=?, claimed=? WHERE id IN "
             "(SELECT id FROM events WHERE handled=0 AND attempts<? "
-            "ORDER BY id LIMIT ?)", (token, MAX_ATTEMPTS, _clamp_limit(n)))
+            "ORDER BY id LIMIT ?)", (token, now, MAX_ATTEMPTS, _clamp_limit(n)))
         rows = self.conn.execute(
             "SELECT id, source, sender, text FROM events "
             "WHERE claim=? AND handled=2", (token,)).fetchall()
@@ -152,13 +182,19 @@ class Memory(object):
             (MAX_ATTEMPTS, event_id))
 
     # ----------------------------------------------------------- messages
-    def add_message(self, thread, role, text):
+    def add_message(self, thread, role, text, event_id=None):
+        """Idempotent per (thread, role, event_id): a retried event won't
+        duplicate the row. Returns the message rowid (None if ignored)."""
         cur = self.conn.execute(
-            "INSERT INTO messages (ts, thread, role, text) VALUES (?,?,?,?)",
-            (time.time(), thread, role, text))
+            "INSERT OR IGNORE INTO messages "
+            "(ts, thread, role, text, event_id) VALUES (?,?,?,?,?)",
+            (time.time(), thread, role, text, event_id))
+        if cur.rowcount == 0:
+            return None                       # duplicate retry; skip FTS too
         self.conn.execute(
             "INSERT INTO messages_fts (rowid, text) VALUES (?,?)",
             (cur.lastrowid, text))
+        return cur.lastrowid
 
     def history(self, thread, limit=10):
         rows = self.conn.execute(
@@ -188,9 +224,12 @@ class Memory(object):
         return [{"key": k, "value": v} for k, v in rows]
 
     # ---------------------------------------------------------- full-text
-    def search(self, query, limit=8, thread=None):
-        """FTS recall, thread-scoped. Correlated on rowid (not content)."""
-        import re
+    def search(self, query, limit=8, thread=None, exclude_id=None):
+        """FTS recall, thread-scoped. Correlated on rowid (not content).
+
+        exclude_id lets the caller drop the row just written so a `recall`
+        doesn't match its own question (FTS5 implicit-AND self-match).
+        """
         q = " ".join(re.findall(r"\w+", str(query))) or str(query)
         limit = _clamp_limit(limit)
         # NB: fts5 rank/rowid can't be reached through a table ALIAS in ORDER BY
@@ -202,6 +241,9 @@ class Memory(object):
         if thread:
             sql += " AND m.thread = ?"
             args.append(thread)
+        if exclude_id is not None:
+            sql += " AND m.id <> ?"
+            args.append(exclude_id)
         sql += " ORDER BY rank LIMIT ?"
         args.append(limit)
         try:
@@ -213,6 +255,9 @@ class Memory(object):
             if thread:
                 lsql += " AND thread = ?"
                 largs.append(thread)
+            if exclude_id is not None:
+                lsql += " AND id <> ?"
+                largs.append(exclude_id)
             lsql += " ORDER BY id DESC LIMIT ?"
             largs.append(limit)
             rows = self.conn.execute(lsql, largs).fetchall()
@@ -246,8 +291,11 @@ class Memory(object):
         if ok:
             self.conn.execute("UPDATE outbox SET sent=1 WHERE id=?", (out_id,))
         else:
+            # terminal state (sent=2) once exhausted so drops are visible
             self.conn.execute(
-                "UPDATE outbox SET attempts=attempts+1 WHERE id=?", (out_id,))
+                "UPDATE outbox SET attempts=attempts+1, sent="
+                "CASE WHEN attempts+1>=? THEN 2 ELSE 0 END WHERE id=?",
+                (MAX_ATTEMPTS, out_id))
 
     def close(self):
         self.conn.close()

@@ -264,5 +264,80 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("Remembered", sent[0][1])
 
 
+class SecurityRegressionTests(unittest.TestCase):
+    """Pin the focused-review fixes so they can't silently regress."""
+
+    def test_any_scheme_dsn_rejected(self):
+        # postgres/mysql/redis DSNs (not just libsql/https) must be refused
+        for dsn in ("postgres://user:pa55@host/db",
+                    "mysql://root@localhost/x",
+                    "redis://:pw@localhost/0"):
+            with self.assertRaises(ValueError):
+                Memory(dsn)
+
+    def test_abandoned_claim_is_reclaimed(self):
+        import time as _time
+        m = Memory(_tmp())
+        m.add_event("cli", "orphan", sender="u1")
+        rows = m.claim()                       # marks handled=2, claimed=now
+        self.assertEqual(len(rows), 1)
+        # simulate a crash: backdate the claim past CLAIM_TTL
+        m.conn.execute("UPDATE events SET claimed=? WHERE handled=2",
+                       (_time.time() - 100000,))
+        again = m.claim()                      # must reclaim, not strand
+        self.assertEqual(len(again), 1)
+        m.close()
+
+    def test_search_excludes_recent_row(self):
+        m = Memory(_tmp())
+        mid = m.add_message("u1", "user", "alpha beta gamma")
+        hits = m.search("alpha beta", exclude_id=mid)
+        self.assertEqual(hits, [])             # own row is dropped
+        hits2 = m.search("alpha beta")         # without exclude it matches
+        self.assertEqual(len(hits2), 1)
+        m.close()
+
+    def test_message_idempotent_per_event(self):
+        m = Memory(_tmp())
+        m.add_message("u1", "user", "hello", event_id=7)
+        m.add_message("u1", "user", "hello", event_id=7)   # retried event
+        n = m.conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE event_id=7").fetchone()[0]
+        self.assertEqual(n, 1)                 # no duplicate
+        m.close()
+
+    def test_outbox_exhaustion_is_terminal(self):
+        m = Memory(_tmp())
+        m.outbox_add("777", "hi")
+        oid = m.outbox_pending()[0][0]
+        for _ in range(6):
+            m.outbox_mark(oid, ok=False)       # keep failing
+        self.assertEqual(len(m.outbox_pending()), 0)   # no longer pending
+        sent = m.conn.execute("SELECT sent FROM outbox WHERE id=?",
+                              (oid,)).fetchone()[0]
+        self.assertEqual(sent, 2)              # terminal dead-letter, not silent
+        m.close()
+
+    def test_recall_does_not_echo_own_question(self):
+        m = Memory(_tmp())
+        n = Nexus(m, brain=ai_mod.StubBrain())
+        n.handle_event(1, "cli", "u1", "remember capital: ankara")
+        # a recall query should surface the FACT, not quote the question back
+        r = n.handle_event(2, "cli", "u1", "what is the capital")
+        self.assertNotIn("what is the capital", r["reply"])
+        m.close()
+
+    def test_exception_log_is_sanitized(self):
+        # a provider error embedding a token must not reach the log verbatim
+        os.environ["TELEGRAM_TOKEN"] = "SECRET_TOKEN_VALUE"
+        try:
+            import nexus_zero.workflow as wf
+            from nexus_zero.core import safe as _safe
+            msg = wf.tg._redact(_safe(Exception("boom SECRET_TOKEN_VALUE")))
+            self.assertNotIn("SECRET_TOKEN_VALUE", msg)
+        finally:
+            del os.environ["TELEGRAM_TOKEN"]
+
+
 if __name__ == "__main__":
     unittest.main()

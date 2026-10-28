@@ -77,9 +77,15 @@ jobs:
           if allowed and chat_id != allowed:
               print("dropped: chat not allowlisted"); raise SystemExit(0)
           text = text or json.dumps(inner)[:500]
+          # raw_id enables the unique-index dedupe: a Telegram retry or an
+          # overlapping cron+dispatch can't create a duplicate event.
+          raw_id = data.get("update_id")
+          if raw_id is None:
+              raw_id = inner.get("update_id")
           from nexus_zero import workflow
-          workflow.ingest(text, source="telegram", sender=chat_id, raw=inner)
-          print("ingested dispatched event")
+          workflow.ingest(text, source="telegram", sender=chat_id, raw=inner,
+                          raw_id=raw_id)
+          print("ingested dispatched event (raw_id=%s)" % raw_id)
           PY
 
       - name: Doctor
@@ -91,10 +97,19 @@ jobs:
       - name: Persist memory back (private repo only — plaintext SQLite)
         if: success()
         run: |
+          # Fail closed on a PUBLIC repo: the SQLite memory is plaintext and
+          # git history is immutable, so publishing it would leak stored
+          # conversations/facts forever.
+          if [ "${{ github.event.repository.private }}" != "true" ]; then
+            echo "::error::repo is PUBLIC — refusing to persist plaintext memory. Make it private or disable this step."
+            exit 1
+          fi
           if [ -f nexus-zero.db ]; then
             git config user.name "nexus-zero-bot"
             git config user.email "nexus-zero@users.noreply.github.com"
-            git add -f nexus-zero.db || true
+            git add -f nexus-zero.db
             git commit -m "nexus: update memory $(date -u +%FT%TZ)" || true
-            git push || true
+            # a lost push silently drops every event ingested this run — surface it
+            git pull --rebase --autostash || { echo "::error::push race on memory"; exit 1; }
+            git push || { echo "::error::push failed — memory not persisted"; exit 1; }
           fi

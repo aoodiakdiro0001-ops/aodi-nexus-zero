@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -19,13 +20,16 @@ from nexus_zero import telegram as tg  # noqa: E402
 from nexus_zero.memory import Memory  # noqa: E402
 
 MAX_BODY = 64 * 1024
+MAX_CONNS = 8  # serve: cap simultaneous connections (thread-exhaustion guard)
+_conn_slots = threading.Semaphore(MAX_CONNS)
 
 
 def cmd_init(args):
     mem = Memory(args.db)
     path = mem.path
     mem.close()
-    print("initialized memory at %s" % path)
+    # basename only: args.db could be an odd value; never echo a full DSN
+    print("initialized memory at %s" % os.path.basename(path))
     return 0
 
 
@@ -93,6 +97,24 @@ def cmd_serve(args):
     class H(BaseHTTPRequestHandler):
         timeout = 15
         protocol_version = "HTTP/1.1"
+
+        def setup(self):
+            # bound concurrency: an unauthenticated client still costs a
+            # thread, so cap simultaneous connections to avoid thread exhaustion
+            if not _conn_slots.acquire(blocking=False):
+                self.close_connection = True
+                raise ConnectionAbortedError("too many connections")
+            try:
+                super().setup()
+            except Exception:
+                _conn_slots.release()
+                raise
+
+        def finish(self):
+            try:
+                super().finish()
+            finally:
+                _conn_slots.release()
 
         def log_message(self, *a):
             pass

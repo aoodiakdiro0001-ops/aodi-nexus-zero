@@ -29,6 +29,7 @@
 //     -d '{"url":"https://<worker>/telegram","secret_token":"<TELEGRAM_WEBHOOK_SECRET>"}'
 
 const encoder = new TextEncoder();
+const MIN_SECRET_LEN = 24;
 
 // constant-time compare of two strings (hash to equal length, then XOR-fold)
 async function timingSafeEqual(a, b) {
@@ -49,11 +50,13 @@ export default {
     if (url.pathname === "/telegram") {
       // Telegram sends the secret as a HEADER, not in the body.
       const got = request.headers.get("X-Telegram-Bot-Api-Secret-Token") || "";
+      if (!strong(env.TELEGRAM_WEBHOOK_SECRET)) return weak("TELEGRAM_WEBHOOK_SECRET");
       if (!(await timingSafeEqual(got, env.TELEGRAM_WEBHOOK_SECRET))) {
         return json({ ok: false, err: "bad telegram secret" }, 403);
       }
     } else if (url.pathname === "/ingest") {
       const got = request.headers.get("X-Nexus-Secret") || "";
+      if (!strong(env.NEXUS_GATEWAY_SECRET)) return weak("NEXUS_GATEWAY_SECRET");
       if (!(await timingSafeEqual(got, env.NEXUS_GATEWAY_SECRET))) {
         return json({ ok: false, err: "bad secret" }, 403);
       }
@@ -68,14 +71,20 @@ export default {
       return json({ ok: false, err: "bad json" }, 400);
     }
 
-    // wake the free runner; 503 on failure so the sender retries
+    // wake the free runner. Retryable failure -> 503 (sender retries);
+    // PERMANENT failure (revoked token, bad repo) -> 500 so we don't spin.
     const dispatched = await wakeRunner(env, url.pathname, payload);
-    if (!dispatched) {
-      return json({ ok: false, err: "runner wake failed; retry" }, 503);
+    if (dispatched === true) return json({ ok: true, routed: url.pathname, dispatched }, 202);
+    if (dispatched === "permanent") {
+      return json({ ok: false, err: "dispatch misconfigured (check GH token/repo)" }, 500);
     }
-    return json({ ok: true, routed: url.pathname, dispatched }, 202);
+    return json({ ok: false, err: "runner wake failed; retry" }, 503);
   },
 };
+
+const strong = (s) => typeof s === "string" && s.length >= MIN_SECRET_LEN;
+const weak = (name) =>
+  json({ ok: false, err: `${name} unset or < ${MIN_SECRET_LEN} chars (fail closed)` }, 500);
 
 async function wakeRunner(env, route, payload) {
   if (!env.GH_OWNER || !env.GH_REPO || !env.GH_DISPATCH_TOKEN) return false;
@@ -94,7 +103,11 @@ async function wakeRunner(env, route, payload) {
       }),
     }
   );
-  return resp.status === 204;
+  return resp.status === 204
+    ? true
+    : [401, 403, 404, 422].includes(resp.status)
+      ? "permanent" // revoked token / bad repo / oversized payload: retry won't help
+      : false;      // transient: let the sender retry (503)
 }
 
 function json(obj, status = 200) {

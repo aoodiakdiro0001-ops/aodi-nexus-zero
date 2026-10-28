@@ -12,14 +12,15 @@ Hardened after audit:
 import hmac
 import json
 import os
+import urllib.error
 import urllib.parse
 import urllib.request
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 API = "https://api.telegram.org/bot%s"
-TIMEOUT = 30
 MIN_SECRET_LEN = 24
+MAX_READ = 1 << 20          # 1 MiB cap — an oversized reply can't exhaust us
 
 
 def _int_env(name, default):
@@ -29,7 +30,16 @@ def _int_env(name, default):
         return default
 
 
-TIMEOUT = _int_env("NEXUS_TG_TIMEOUT", 30)
+# bound the timeout: accept env but clamp to a sane, non-zero window
+TIMEOUT = max(1, min(_int_env("NEXUS_TG_TIMEOUT", 30), 120))
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(newurl, code, "redirect blocked", headers, fp)
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
 
 
 def _redact(msg):
@@ -44,8 +54,8 @@ def _post(method, payload):
     url = (API % TOKEN) + "/" + method
     req = urllib.request.Request(
         url, data=urllib.parse.urlencode(payload).encode("utf-8"))
-    with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
-        return json.loads(r.read().decode("utf-8"))
+    with _OPENER.open(req, timeout=TIMEOUT) as r:
+        return json.loads(r.read(MAX_READ).decode("utf-8"))
 
 
 def send(text, chat_id=None):

@@ -53,8 +53,10 @@ print(summary["processed"])                                           # drained 
 - `set_fact / get_fact` — long-term preferences (upsert)
 - `log_run` — audit trail of every decision the core made
 
-Point `NEXUS_DB` at a local file (default) or a Turso/Supabase libsql URL —
-the schema is identical on both, which is what keeps the stack swappable.
+Point `NEXUS_DB` at a local SQLite file (the default). A remote libsql/Turso
+URL is rejected by design — `sqlite3.connect` cannot open a URL, so the old
+"swap to Turso" claim was false and is now refused loudly. To go remote, bring
+your own HTTP libsql adapter behind the `Memory` interface.
 
 ## Brains (`nexus_zero.ai.get_brain(kind)`)
 | kind | Backend | Needs |

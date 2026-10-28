@@ -37,22 +37,24 @@ class Nexus(object):
         """
         thread = sender or "default"
         text = str(text)
-        self.mem.add_message(thread, "user", text)
+        user_msg_id = self.mem.add_message(thread, "user", text, event_id=event_id)
 
         c = self.brain.classify(text)
         intent, conf = c["intent"], c["confidence"]
 
         context = self.mem.history(thread, limit=8)
-        action, reply = self._route(intent, text, thread, context)
+        # exclude the row just written so a `recall` can't match its own question
+        action, reply = self._route(intent, text, thread, context,
+                                    exclude_id=user_msg_id)
 
-        self.mem.add_message(thread, "assistant", reply)
+        self.mem.add_message(thread, "assistant", reply, event_id=event_id)
         self.mem.log_run(intent, action, text)
         if event_id is not None:
             self.mem.mark_handled(event_id)
         return {"intent": intent, "confidence": conf, "action": action,
                 "reply": reply, "thread": thread}
 
-    def _route(self, intent, text, thread, context):
+    def _route(self, intent, text, thread, context, exclude_id=None):
         if intent == "remember":
             key, val = self._parse_kv(text)
             if key:
@@ -62,7 +64,8 @@ class Nexus(object):
                 "I could not find a 'key: value' pair to remember. "
                 "Try: remember language: arabic")
         if intent == "recall":
-            hits = self.mem.search(text, limit=5, thread=thread)
+            hits = self.mem.search(text, limit=5, thread=thread,
+                                   exclude_id=exclude_id)
             if hits:
                 body = "\n".join("- %s" % safe(h["text"]) for h in hits)
                 return "recall", "Here is what I recall:\n%s" % body
