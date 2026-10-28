@@ -37,7 +37,7 @@ Cloudflare Worker ──► إيقاظ GitHub Actions (repository_dispatch)
 
 ## Quickstart — offline in seconds
 
-Python 3.8+، مكتبة قياسية فقط. يعمل دون اتصال تماماً مع `NEXUS_AI=stub`.
+Python 3.10+ (stdlib only — verified on 3.10/3.11/3.12 in CI). Works fully offline with `NEXUS_AI=stub`.
 
 ```bash
 export NEXUS_AI=stub
