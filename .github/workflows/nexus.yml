@@ -1,0 +1,100 @@
+# Nexus-Zero execution engine — runs on GitHub Actions free tier.
+#
+# Two triggers:
+#   schedule:  hourly cron — drain the queue, run the agentic core, reply.
+#   workflow_dispatch / repository_dispatch: on-demand wake from the
+#     Cloudflare Worker (event_type: nexus-ingest) when a message arrives.
+#
+# Free-tier math: private repos get ~2,000 free minutes/month. A ~30s tick
+# hourly = ~720 runs = ~15–20 minutes/month. Public repos: unlimited minutes
+# (but keep it PRIVATE if you persist memory here — see the note below).
+#
+# REQUIRED SECRETS (Settings → Secrets → Actions):
+#   TELEGRAM_TOKEN      bot token from @BotFather
+#   TELEGRAM_CHAT_ID    your chat id (also the inbound ALLOWLIST)
+#   NEXUS_GATEWAY_SECRET  must match the Worker's (>= 24 chars)
+#   NEXUS_AI            stub | ollama | hf   (default: stub)
+#   HF_TOKEN            optional — only if NEXUS_AI=hf
+#   NEXUS_DB_TURSO      optional — currently ignored for remote libsql (see
+#                       nexus_zero/memory.py: remote DSNs need an HTTP client)
+
+name: nexus-zero
+
+on:
+  schedule:
+    - cron: "17 * * * *"   # hourly at :17 (off the top-of-hour stampede)
+  workflow_dispatch:
+  repository_dispatch:
+    types: [nexus-ingest]
+
+permissions:
+  contents: write   # to commit updated memory back to the repo
+
+# Single-writer lock: a cron tick and a dispatch wake must never run the same
+# DB concurrently (they would both checkout + push, and the loser's update is
+# silently dropped). Serialize them; never cancel an in-flight tick.
+concurrency:
+  group: nexus-tick
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    # env via mapping (NOT `echo ${{ secrets.X }}`) so a secret containing
+    # quotes/$()/backticks/newlines can never execute as shell.
+    env:
+      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      NEXUS_GATEWAY_SECRET: ${{ secrets.NEXUS_GATEWAY_SECRET }}
+      NEXUS_AI: ${{ secrets.NEXUS_AI || 'stub' }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      NEXUS_DB: nexus-zero.db
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Ingest dispatched payload (if woken by the Worker)
+        if: github.event_name == 'repository_dispatch'
+        run: |
+          python - <<'PY'
+          import json, os
+          path = os.environ.get("GITHUB_EVENT_PATH")
+          data = json.load(open(path)) if path and os.path.exists(path) else {}
+          inner = (data.get("client_payload") or {}).get("payload") or {}
+          msg = inner.get("message") or inner.get("edited_message")
+          text, chat_id = None, None
+          if isinstance(msg, dict) and isinstance(msg.get("text"), str):
+              text = msg["text"]
+              cid = (msg.get("chat") or {}).get("id")
+              chat_id = str(cid) if cid is not None else None
+          # authorize: only the operator's chat may enqueue work
+          allowed = os.environ.get("TELEGRAM_CHAT_ID") or ""
+          if allowed and chat_id != allowed:
+              print("dropped: chat not allowlisted"); raise SystemExit(0)
+          text = text or json.dumps(inner)[:500]
+          from nexus_zero import workflow
+          workflow.ingest(text, source="telegram", sender=chat_id, raw=inner)
+          print("ingested dispatched event")
+          PY
+
+      - name: Doctor
+        run: python -m nexus_zero.cli doctor || true
+
+      - name: Run the agentic tick
+        run: python -m nexus_zero.cli tick --json
+
+      - name: Persist memory back (private repo only — plaintext SQLite)
+        if: success()
+        run: |
+          if [ -f nexus-zero.db ]; then
+            git config user.name "nexus-zero-bot"
+            git config user.email "nexus-zero@users.noreply.github.com"
+            git add -f nexus-zero.db || true
+            git commit -m "nexus: update memory $(date -u +%FT%TZ)" || true
+            git push || true
+          fi
