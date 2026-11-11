@@ -100,9 +100,14 @@ jobs:
           # Fail closed on a PUBLIC repo: the SQLite memory is plaintext and
           # git history is immutable, so publishing it would leak stored
           # conversations/facts forever.
+          #
+          # Policy: skip (warn) rather than abort. Exiting 1 kept every cron run
+          # red forever on a repo that is public by design, which trained the
+          # signal away. Nothing is written — the leak guard still holds.
+          # To actually persist, flip the repo to PRIVATE and restore `exit 1`.
           if [ "${{ github.event.repository.private }}" != "true" ]; then
-            echo "::error::repo is PUBLIC — refusing to persist plaintext memory. Make it private or disable this step."
-            exit 1
+            echo "::warning::repo is PUBLIC — skipping plaintext memory persistence (make the repo private to enable it)."
+            exit 0
           fi
           if [ -f nexus-zero.db ]; then
             git config user.name "nexus-zero-bot"
